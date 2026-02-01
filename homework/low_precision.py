@@ -75,18 +75,21 @@ class Linear4Bit(torch.nn.Module):
             # Load the original weights and remove them from the state_dict (mark them as loaded)
             weight = state_dict[f"{prefix}weight"]
             del state_dict[f"{prefix}weight"]
-            # Move weight to target device before quantizing to avoid uint8 corruption
-            weight = weight.to(self.weight_q4.device)
             # Quantize the weights and store them in self.weight_q4 and self.weight_norm
             # Flatten the weight tensor to 1D for quantization
             weight_flat = weight.view(-1)
             # Quantize using the provided block_quantize_4bit function
-            self.weight_q4.data, self.weight_norm.data = block_quantize_4bit(weight_flat, self._group_size)
+            packed, norm = block_quantize_4bit(weight_flat, self._group_size)
+            self.weight_q4.data = packed.view(-1)
+            self.weight_norm.data = norm
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
+            # Reshape weight_q4 back to 2D for dequantization
+            num_groups = self.weight_norm.size(0)
+            weight_q4_2d = self.weight_q4.view(num_groups, -1)
             # Dequantize the weights
-            weight_dequant = block_dequantize_4bit(self.weight_q4, self.weight_norm)
+            weight_dequant = block_dequantize_4bit(weight_q4_2d, self.weight_norm)
             # Reshape back to original weight shape
             weight_dequant = weight_dequant.view(self._shape)
             # Perform linear operation

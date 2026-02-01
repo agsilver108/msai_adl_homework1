@@ -9,20 +9,23 @@ def block_quantize_3bit(x: torch.Tensor, group_size: int = 32) -> tuple[torch.Te
     """
     Quantize the input tensor to 3-bit precision (0-7 values).
     Pack efficiently: 8 values into 3 bytes.
+    Uses asymmetric quantization for better precision with minimal overhead.
     """
     assert x.dim() == 1
     assert x.size(0) % group_size == 0
     assert group_size % 8 == 0  # group_size must be multiple of 8 for packing
 
     x = x.view(-1, group_size)
-    # Find normalization factor per group
-    normalization = x.abs().max(dim=-1, keepdim=True).values
+    # Asymmetric quantization: track min and max separately
+    x_min = x.min(dim=-1, keepdim=True).values
+    x_max = x.max(dim=-1, keepdim=True).values
     # Avoid division by zero
-    normalization = torch.where(normalization == 0, torch.ones_like(normalization), normalization)
-    # Normalize to [0, 1] range
-    x_norm = (x + normalization) / (2 * normalization)
-    # Quantize to 3 bits (0-7)
-    x_quant = (x_norm * 7).round().clamp(0, 7).to(torch.uint8)
+    scale = x_max - x_min
+    scale = torch.where(scale == 0, torch.ones_like(scale), scale)
+    # Normalize to [0, 1] range using actual min/max
+    x_norm = (x - x_min) / scale
+    # Quantize to 3 bits (0-7) - use floor(x + 0.5) for better rounding
+    x_quant = torch.floor(x_norm * 7 + 0.5).clamp(0, 7).to(torch.uint8)
     
     # Pack 8 values into 3 bytes (3 bits each = 24 bits)
     # Reshape to process 8 values at a time
@@ -37,18 +40,22 @@ def block_quantize_3bit(x: torch.Tensor, group_size: int = 32) -> tuple[torch.Te
     # Flatten packed data
     x_packed = x_packed.view(-1, group_size // 8 * 3)
     
-    return x_packed, normalization.squeeze(-1).to(torch.float16)
+    # Stack min and max for storage (shape: num_groups, 2)
+    params = torch.stack([x_min.squeeze(-1), x_max.squeeze(-1)], dim=-1).to(torch.float16)
+    
+    return x_packed, params
 
 
-def block_dequantize_3bit(x_packed: torch.Tensor, normalization: torch.Tensor, group_size: int = 32) -> torch.Tensor:
+def block_dequantize_3bit(x_packed: torch.Tensor, params: torch.Tensor, group_size: int = 32) -> torch.Tensor:
     """
     Dequantize from 3-bit back to float32.
+    params contains [min, max] for each group.
     """
     assert group_size % 8 == 0
     
     # x_packed has shape (num_groups * group_size // 8 * 3,)
     # Each group of 32 values is stored in 12 bytes (32 // 8 * 3)
-    num_groups = normalization.size(0)
+    num_groups = params.size(0)
     bytes_per_group = group_size // 8 * 3
     
     # Reshape to (num_groups, bytes_per_group)
@@ -70,14 +77,21 @@ def block_dequantize_3bit(x_packed: torch.Tensor, normalization: torch.Tensor, g
     
     # Reshape to match group structure (num_groups, group_size)
     x_quant = x_quant.view(num_groups, group_size)
-    normalization = normalization.to(torch.float32).unsqueeze(-1)
+    
+    # Extract min and max
+    params = params.to(torch.float32)
+    x_min = params[:, 0:1]
+    x_max = params[:, 1:2]
+    scale = x_max - x_min
+    
+    # Dequantize
     x_norm = x_quant.to(torch.float32) / 7.0
-    x = (x_norm * 2 * normalization) - normalization
+    x = x_norm * scale + x_min
     return x.view(-1)
 
 
 class Linear3Bit(torch.nn.Module):
-    def __init__(self, in_features: int, out_features: int, bias: bool = True, group_size: int = 32) -> None:
+    def __init__(self, in_features: int, out_features: int, bias: bool = True, group_size: int = 64) -> None:
         super().__init__()
         self._shape = (out_features, in_features)
         self._group_size = group_size
@@ -92,9 +106,10 @@ class Linear3Bit(torch.nn.Module):
             torch.zeros(num_packed, dtype=torch.uint8),
             persistent=False,
         )
+        # Store min and max for each group (shape: num_groups, 2)
         self.register_buffer(
-            "weight_norm",
-            torch.zeros(num_groups, dtype=torch.float16),
+            "weight_params",
+            torch.zeros(num_groups, 2, dtype=torch.float16),
             persistent=False,
         )
         
@@ -111,16 +126,15 @@ class Linear3Bit(torch.nn.Module):
             weight = state_dict[f"{prefix}weight"]
             del state_dict[f"{prefix}weight"]
             
-            # Move weight to target device before quantizing to avoid uint8 corruption
-            weight = weight.to(self.weight_q3.device)
+            # Quantize on original device to avoid device transfer precision loss
             weight_flat = weight.view(-1)
-            packed, norm = block_quantize_3bit(weight_flat, self._group_size)
+            packed, params = block_quantize_3bit(weight_flat, self._group_size)
             self.weight_q3.data = packed.view(-1)
-            self.weight_norm.data = norm
+            self.weight_params.data = params
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
-            weight_dequant = block_dequantize_3bit(self.weight_q3, self.weight_norm, self._group_size)
+            weight_dequant = block_dequantize_3bit(self.weight_q3, self.weight_params, self._group_size)
             weight_dequant = weight_dequant.view(self._shape)
             return torch.nn.functional.linear(x, weight_dequant, self.bias)
 
@@ -134,11 +148,11 @@ class BigNet3Bit(torch.nn.Module):
         def __init__(self, channels):
             super().__init__()
             self.model = torch.nn.Sequential(
-                Linear3Bit(channels, channels, group_size=32),
+                Linear3Bit(channels, channels, group_size=64),
                 torch.nn.ReLU(),
-                Linear3Bit(channels, channels, group_size=32),
+                Linear3Bit(channels, channels, group_size=64),
                 torch.nn.ReLU(),
-                Linear3Bit(channels, channels, group_size=32),
+                Linear3Bit(channels, channels, group_size=64),
             )
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
