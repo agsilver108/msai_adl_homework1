@@ -90,8 +90,8 @@ class Linear4Bit(torch.nn.Module):
             weight_q4_2d = self.weight_q4.view(num_groups, -1)
             # Dequantize the weights
             weight_dequant = block_dequantize_4bit(weight_q4_2d, self.weight_norm)
-            # Reshape back to original weight shape
-            weight_dequant = weight_dequant.view(self._shape)
+            # Reshape back to original weight shape and move to input device
+            weight_dequant = weight_dequant.view(self._shape).to(x.device)
             # Perform linear operation
             return torch.nn.functional.linear(x, weight_dequant, self.bias)
 

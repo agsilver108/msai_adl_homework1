@@ -135,7 +135,7 @@ class Linear3Bit(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
             weight_dequant = block_dequantize_3bit(self.weight_q3, self.weight_params, self._group_size)
-            weight_dequant = weight_dequant.view(self._shape)
+            weight_dequant = weight_dequant.view(self._shape).to(x.device)
             return torch.nn.functional.linear(x, weight_dequant, self.bias)
 
 
