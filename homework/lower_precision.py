@@ -129,8 +129,9 @@ class Linear3Bit(torch.nn.Module):
             # Quantize on original device to avoid device transfer precision loss
             weight_flat = weight.view(-1)
             packed, params = block_quantize_3bit(weight_flat, self._group_size)
-            self.weight_q3.data = packed.view(-1)
-            self.weight_params.data = params
+            # Move to buffer device (handles case where model is on CUDA but weights loaded from CPU)
+            self.weight_q3.data = packed.view(-1).to(self.weight_q3.device)
+            self.weight_params.data = params.to(self.weight_params.device)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
