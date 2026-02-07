@@ -80,9 +80,12 @@ class Linear4Bit(torch.nn.Module):
             weight_flat = weight.view(-1)
             # Quantize using the provided block_quantize_4bit function
             packed, norm = block_quantize_4bit(weight_flat, self._group_size)
-            # Move to buffer device (handles case where model is on CUDA but weights loaded from CPU)
-            self.weight_q4.data = packed.view(-1).to(self.weight_q4.device)
-            self.weight_norm.data = norm.to(self.weight_norm.device)
+            # Detect target device: use existing buffer device (already on correct device from model.to)
+            # Don't use weight.device as weight is from CPU state_dict being loaded
+            target_device = self.weight_q4.device
+            # Move to target device (handles case where model is on CUDA but weights loaded from CPU)
+            self.weight_q4.data = packed.view(-1).to(target_device)
+            self.weight_norm.data = norm.to(target_device)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
